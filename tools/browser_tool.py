@@ -55,12 +55,13 @@ import json
 import logging
 import os
 import re
-import subprocess
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+from urllib.parse import urlparse
 import requests
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
@@ -455,6 +456,63 @@ def _resolve_cdp_override(cdp_url: str) -> str:
         _sanitize_url_for_logs(version_url),
     )
     return raw
+
+
+def _cdp_url_to_cli_arg(cdp_url: str) -> str:
+    """Convert a concrete websocket CDP URL into the form agent-browser's
+    ``--cdp`` flag expects (``<port>`` or ``<host>:<port>``).
+
+    agent-browser's CLI parser (Rust binary) does not understand full
+    ``ws://host:port/devtools/browser/<uuid>`` endpoints — it tries to parse
+    the entire string as a port number and panics with "Invalid CDP port:
+    'ws://...' is not a valid number". Hermes normalizes the user-supplied
+    CDP URL into a websocket URL via ``_resolve_cdp_override()`` so all
+    discovery flows converge on one shape, but the CLI consumer can't cope
+    with that shape. This helper is the bridge.
+
+    Args:
+        cdp_url: Either a ``ws://``/``wss://`` websocket endpoint (the common
+            case after ``_resolve_cdp_override()``), a plain ``host:port``,
+            or just a port number.
+
+    Returns:
+        ``"<port>"`` when the host is ``localhost``/``127.0.0.1``/``::1``
+        (agent-browser's default), or ``"<host>:<port>"`` otherwise.
+    """
+    raw = (cdp_url or "").strip()
+    if not raw:
+        raise ValueError("Empty CDP URL")
+
+    # Already a plain port — pass through unchanged.
+    if raw.isdigit():
+        return raw
+
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    hostname = parsed.hostname  # urlparse strips brackets for IPv6
+
+    # ws://host:port[/path] — reverse-engineer host:port for --cdp.
+    if scheme in ("ws", "wss"):
+        host = hostname or "localhost"
+        # Default ws/wss ports if not explicitly given.
+        port = parsed.port or (443 if scheme == "wss" else 80)
+    elif scheme in ("http", "https"):
+        host = hostname or "localhost"
+        port = parsed.port or (443 if scheme == "https" else 80)
+    elif hostname is not None:
+        # Bare "host:port" parsed successfully (e.g. "example.com:9222" or
+        # "[::1]:9222" — urlparse handles both). Keep as-is.
+        return raw
+    elif ":" in raw:
+        # Last-resort: bare "host:port" without scheme. Pass through.
+        return raw
+    else:
+        # Last resort: treat as port. Will fail loudly if not numeric.
+        return raw
+
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return str(port)
+    return f"{host}:{port}"
 
 
 def _get_cdp_override() -> str:
@@ -2155,8 +2213,28 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     """
     Find the agent-browser CLI executable.
 
-    Checks in order: current PATH, Homebrew/common bin dirs, Hermes-managed
-    node, local node_modules/.bin/, npx fallback.
+    Checks in order:
+      0. ``HERMES_BROWSER_BIN`` env var (explicit override; wins outright)
+      1. ``browser.binary_path`` in config.yaml (persistent config override)
+      2. current PATH, Homebrew/common bin dirs, Hermes-managed
+         node, local node_modules/.bin/, npx fallback.
+
+    The override mechanisms exist because PATH-based search is unreliable
+    in two real scenarios: (a) a globally-installed agent-browser symlink
+    points at a binary that a later ``hermes update`` invalidates
+    (issue #48521), and (b) the global package version is older than the
+    one we shipped with via ``npx`` and its daemon doesn't start on this
+    platform — the search order caches the first runnable candidate and
+    ``agent_browser_runnable`` only probes ``--version``, which a buggy
+    daemon still answers cleanly. ``HERMES_BROWSER_BIN`` (env) and
+    ``browser.binary_path`` (config) let users pin to a specific working
+    build without re-installing globally.
+
+    Per the project's AGENTS.md, behavioral settings belong in
+    config.yaml rather than .env (which is for secrets only). The env
+    var is still consulted first as a transient override for emergency
+    rollback (e.g. when a freshly-pinned binary breaks and the user
+    wants to revert without editing config).
 
     Returns:
         Path to agent-browser executable
@@ -2165,6 +2243,43 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         FileNotFoundError: If agent-browser is not installed
     """
     global _cached_agent_browser, _agent_browser_resolved
+
+    # 0. Env override — wins outright. No validation, no fall-through.
+    # Transient override for emergency rollback without editing config.
+    explicit = os.environ.get("HERMES_BROWSER_BIN", "").strip()
+    if explicit:
+        _cached_agent_browser = explicit
+        _agent_browser_resolved = True
+        return explicit
+
+    # 1. config.yaml override — persistent. Same shape as the env override
+    # but read through the same path that all other browser.* settings use,
+    # so the user discovers it in the same place as cdp_url, cloud_provider,
+    # engine, headless, dialog_policy, etc. Reads raw (no normalisation) so
+    # we hand the user's exact string to subprocess. We still validate, so a
+    # typo or wrong-arch path is caught and falls through to PATH search
+    # instead of silently breaking every browser tool.
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {})
+        if isinstance(browser_cfg, dict):
+            configured = str(browser_cfg.get("binary_path", "") or "").strip()
+            if configured:
+                if not validate or agent_browser_runnable(configured):
+                    _cached_agent_browser = configured
+                    _agent_browser_resolved = True
+                    return configured
+                # Configured path exists but doesn't pass runnable check —
+                # fall through to PATH search rather than raising, so a
+                # transient breakage doesn't brick all browser tools.
+                logger.warning(
+                    "Configured browser.binary_path=%r failed runnable check; "
+                    "falling through to PATH search", configured,
+                )
+    except Exception as e:
+        logger.debug("Could not read browser.binary_path from config: %s", e)
+
     if _agent_browser_resolved:
         if _cached_agent_browser is None:
             raise FileNotFoundError(
@@ -2372,14 +2487,23 @@ def _run_browser_command(
         return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
 
     # Build the command with the appropriate backend flag.
-    # Cloud mode: --cdp <websocket_url> connects to Browserbase.
+    # CDP override mode: --cdp <host:port> connects to a running browser.
     # Local mode: --session <name> launches a local headless Chromium.
     # The rest of the command (--json, command, args) is identical.
     if session_info.get("cdp_url"):
-        # Cloud mode — connect to remote Browserbase browser via CDP
+        # CDP mode — connect to an already-running browser via DevTools Protocol.
         # IMPORTANT: Do NOT use --session with --cdp. In agent-browser >=0.13,
         # --session creates a local browser instance and silently ignores --cdp.
-        backend_args = ["--cdp", session_info["cdp_url"]]
+        #
+        # NOTE: agent-browser's `--cdp` flag only accepts `<port>` or `<host:port>`,
+        # NOT a full `ws://host:port/devtools/browser/<uuid>` endpoint. The
+        # Hermes side normalizes the user-supplied CDP URL into a concrete
+        # websocket URL via _resolve_cdp_override() (so /json/version lookups
+        # and CDPs that return discovery URLs all flow through one path), so
+        # we have to reverse-engineer the host:port here before handing it
+        # to the CLI. Without this, agent-browser panics with
+        # "Invalid CDP port: 'ws://...' is not a valid number".
+        backend_args = ["--cdp", _cdp_url_to_cli_arg(session_info["cdp_url"])]
     else:
         # Local mode — launch Chromium (headless by default, headed when configured)
         backend_args = ["--session", session_info["session_name"]]
