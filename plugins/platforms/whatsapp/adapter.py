@@ -271,10 +271,37 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._bridge_port: int = extra.get("bridge_port", 3000)
         self._bridge_script: str = extra.get("bridge_script", str(self._DEFAULT_BRIDGE_DIR / "bridge.js"))
         self._session_path = Path(extra.get("session_path", get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")))
-        self._reply_prefix: Optional[str] = extra.get("reply_prefix")
+        # ``hermes config set whatsapp.reply_prefix ""`` writes the YAML
+        # string literal ``'""'`` (4 chars: ``"\""``).  Adapter is purely
+        # transport — pass whatever the user configured straight through so
+        # the bridge can interpret it.  Treat the YAML literal sentinel as
+        # empty so the bridge sees the same payload a manual ``reply_prefix:
+        # ""`` would have produced.
+        _raw_reply_prefix = config.extra.get("reply_prefix")
+        if _raw_reply_prefix == '""':
+            _raw_reply_prefix = ""
+        self._reply_prefix: Optional[str] = _raw_reply_prefix
         self._dm_policy = str(_extra_or_secret(extra, "dm_policy", "WHATSAPP_DM_POLICY", "pairing")).strip().lower()
-        self._allow_from = self._coerce_allow_list(self._select_dm_allowlist(extra, ("WHATSAPP_ALLOWED_USERS",), _wenv))
-        self._group_policy = str(_extra_or_secret(extra, "group_policy", "WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
+        # Prefer config.extra, then the documented WHATSAPP_ALLOWED_USERS env
+        # (setup wizard / pairing mirror). Select by key *presence* so an
+        # explicit empty allow_from: [] stays authoritative and does not fall
+        # through to a lower-precedence env grant. Track which source won so
+        # live DM checks preserve that precedence. Env reads go through the
+        # profile secret scope (_wenv) so multiplexed profiles see their own.
+        if "allow_from" in config.extra:
+            self._dm_allowlist_source = "config"
+            allow_raw = config.extra.get("allow_from")
+        elif "allowFrom" in config.extra:
+            self._dm_allowlist_source = "config"
+            allow_raw = config.extra.get("allowFrom")
+        elif _wenv("WHATSAPP_ALLOWED_USERS"):
+            self._dm_allowlist_source = "WHATSAPP_ALLOWED_USERS"
+            allow_raw = _wenv("WHATSAPP_ALLOWED_USERS")
+        else:
+            self._dm_allowlist_source = None
+            allow_raw = None
+        self._allow_from = self._coerce_allow_list(allow_raw)
+        self._group_policy = str(extra.get("group_policy") or _wenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
         self._group_allow_from = self._coerce_allow_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         rr = extra.get("send_read_receipts", False)
         self._send_read_receipts = rr if isinstance(rr, bool) else str(rr or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -491,7 +518,60 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             await asyncio.sleep(1)
             # Bridge output goes to a log file so QR codes, errors, and reconnection messages survive for troubleshooting.
             self._bridge_log = self._session_path.parent / "bridge.log"
-            self._bridge_log_fh = bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
+            bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
+            self._bridge_log_fh = bridge_log_fh
+
+            # Build bridge subprocess environment.
+            # Pass WHATSAPP_REPLY_PREFIX from config.yaml so the Node bridge
+            # can use it without the user needing to set a separate env var.
+            # with_hermes_node_path() copies os.environ when called with no arg.
+            bridge_env = with_hermes_node_path()
+            # Always inject WHATSAPP_REPLY_PREFIX (even when empty) so the
+            # bridge receives the user's configured intent verbatim.  The
+            # bridge's formatOutgoingMessage treats an empty REPLY_PREFIX
+            # as falsy and skips the prefix.
+            if self._reply_prefix is not None:
+                bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
+            bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
+                "true" if self._send_read_receipts else "false"
+            )
+            # Under multiplexing, the bridge subprocess runs with a copy of
+            # os.environ that does NOT contain the secondary profile's .env
+            # vars.  Inject the resolved WHATSAPP_* values so the Node bridge
+            # (which reads process.env.WHATSAPP_MODE etc.) sees the profile's
+            # own configuration instead of falling back to self-chat defaults.
+            _profile_wa_mode = _wenv("WHATSAPP_MODE", "self-chat")
+            if _profile_wa_mode:
+                bridge_env["WHATSAPP_MODE"] = _profile_wa_mode
+            for _key in (
+                "WHATSAPP_ALLOWED_USERS", "WHATSAPP_ALLOW_FROM",
+                "WHATSAPP_DM_POLICY", "WHATSAPP_GROUP_POLICY",
+                "WHATSAPP_GROUP_ALLOWED_USERS", "WHATSAPP_GROUP_ALLOW_FROM",
+                "WHATSAPP_REQUIRE_MENTION", "WHATSAPP_MENTION_PATTERNS",
+                "WHATSAPP_FREE_RESPONSE_CHATS",
+                # Full set bridge.js consumes -- without these a secondary
+                # profile's bridge silently reverts to defaults for debug,
+                # forwarding, prefixes, and send pacing.
+                "WHATSAPP_DEBUG", "WHATSAPP_FORWARD_OWNER_MESSAGES",
+                "WHATSAPP_REPLY_PREFIX", "WHATSAPP_MAX_MESSAGE_LENGTH",
+                "WHATSAPP_CHUNK_DELAY_MS", "WHATSAPP_SEND_TIMEOUT_MS",
+            ):
+                _v = _wenv(_key)
+                if _v:
+                    bridge_env[_key] = _v
+            # Pass the profile-aware cache directories so the bridge writes
+            # media where the Python side reads it.  Without these the bridge
+            # hardcodes ~/.hermes/{image,audio,document}_cache, which diverges
+            # under HERMES_HOME overrides, profiles, and the new cache/ layout.
+            from gateway.platforms.base import (
+                get_audio_cache_dir as _get_audio_dir,
+                get_document_cache_dir as _get_doc_dir,
+                get_image_cache_dir as _get_img_dir,
+            )
+            bridge_env["HERMES_IMAGE_CACHE_DIR"] = str(_get_img_dir())
+            bridge_env["HERMES_AUDIO_CACHE_DIR"] = str(_get_audio_dir())
+            bridge_env["HERMES_DOCUMENT_CACHE_DIR"] = str(_get_doc_dir())
+
             self._bridge_process = subprocess.Popen(
                 [find_node_executable("node") or "node", str(bridge_path), "--port", str(self._bridge_port), "--session", str(self._session_path),
                  "--mode", _wenv("WHATSAPP_MODE", "self-chat")], stdout=bridge_log_fh, stderr=bridge_log_fh, env=self._bridge_env(), **windows_detach_popen_kwargs())
