@@ -584,7 +584,15 @@ def _run_browser_command(
     # state: hybrid routing can create a local sidecar while a cloud provider stays configured.
     engine = _engine_override or _cloud._get_browser_engine()
     if session_info.get("cdp_url"):
-        backend_args = ["--cdp", session_info["cdp_url"]]
+        # agent-browser's ``--cdp`` flag only accepts ``<port>`` or ``<host>:<port>``,
+        # NOT a full ``ws://host:port/devtools/browser/<uuid>`` endpoint. The Hermes
+        # side normalizes the user-supplied CDP URL into a concrete websocket URL via
+        # ``_cdp._resolve_cdp_override()`` (so /json/version lookups and CDPs that
+        # return discovery URLs all flow through one path), so we have to reverse-
+        # engineer the host:port here before handing it to the CLI. Without this,
+        # agent-browser panics with "Invalid CDP port: 'ws://...' is not a valid
+        # number".
+        backend_args = ["--cdp", _cdp._cdp_url_to_cli_arg(session_info["cdp_url"])]
     else:
         backend_args = ["--session", session_info["session_name"]]
         if _cloud._is_headed_mode():

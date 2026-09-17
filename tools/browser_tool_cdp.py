@@ -5,6 +5,7 @@ Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt
 import contextlib
 import os
 from typing import Tuple
+from urllib.parse import urlparse
 
 from agent.proxy_bypass import loopback_request_kwargs
 from tools.browser_tool_origin import origin_module as _origin
@@ -68,6 +69,63 @@ def _get_cdp_override() -> str:
     """
     _bt = _origin()
     return _resolve_cdp_override(raw) if (raw := _get_cdp_override_raw()) else ""
+
+
+def _cdp_url_to_cli_arg(cdp_url: str) -> str:
+    """Convert a concrete websocket CDP URL into the form agent-browser's
+    ``--cdp`` flag expects (``<port>`` or ``<host>:<port>``).
+
+    agent-browser's CLI parser (Rust binary) does not understand full
+    ``ws://host:port/devtools/browser/<uuid>`` endpoints — it tries to parse
+    the entire string as a port number and panics with "Invalid CDP port:
+    'ws://...' is not a valid number". Hermes normalizes the user-supplied
+    CDP URL into a websocket URL via :func:`_resolve_cdp_override` so all
+    discovery flows converge on one shape, but the CLI consumer can't cope
+    with that shape. This helper is the bridge.
+
+    Args:
+        cdp_url: Either a ``ws://``/``wss://`` websocket endpoint (the common
+            case after :func:`_resolve_cdp_override`), a plain ``host:port``,
+            or just a port number.
+
+    Returns:
+        ``"<port>"`` when the host is ``localhost``/``127.0.0.1``/``::1``
+        (agent-browser's default), or ``"<host>:<port>"`` otherwise.
+    """
+    raw = (cdp_url or "").strip()
+    if not raw:
+        raise ValueError("Empty CDP URL")
+
+    # Already a plain port — pass through unchanged.
+    if raw.isdigit():
+        return raw
+
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    hostname = parsed.hostname  # urlparse strips brackets for IPv6
+
+    # ws://host:port[/path] — reverse-engineer host:port for --cdp.
+    if scheme in ("ws", "wss"):
+        host = hostname or "localhost"
+        # Default ws/wss ports if not explicitly given.
+        port = parsed.port or (443 if scheme == "wss" else 80)
+    elif scheme in ("http", "https"):
+        host = hostname or "localhost"
+        port = parsed.port or (443 if scheme == "https" else 80)
+    elif hostname is not None:
+        # Bare "host:port" parsed successfully (e.g. "example.com:9222" or
+        # "[::1]:9222" — urlparse handles both). Keep as-is.
+        return raw
+    elif ":" in raw:
+        # Last-resort: bare "host:port" without scheme. Pass through.
+        return raw
+    else:
+        # Last resort: treat as port. Will fail loudly if not numeric.
+        return raw
+
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return str(port)
+    return f"{host}:{port}"
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:

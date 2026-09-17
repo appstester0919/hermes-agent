@@ -113,9 +113,24 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     local node_modules binary, which vanishes on the next ``hermes update`` and leaves a dangling link ``which``
     still reports (exec fails with 127). Candidates are validated with ``agent_browser_runnable`` before caching
     so a dead one falls through. ``validate=False`` (schema-time check_fn) only tests presence and never caches.
+
+    ``HERMES_BROWSER_BIN`` env var (explicit override; wins outright) lets users pin to a specific working build
+    when PATH-based search finds a stale symlink or a globally-installed version whose daemon won't spawn on
+    this host — common after a fresh ``hermes update`` invalidates a global symlink (#48521), or when the
+    shipped ``npx``-cached agent-browser daemon refuses to start on the host platform. The override is trusted
+    outright (no validation) so we don't trigger a 30-second subprocess probe on a path the user picked.
+
     Raises FileNotFoundError when agent-browser is not installed.
     """
     _bt = _origin()
+
+    # Explicit override wins outright — no validation, no fall-through.
+    # Users opt into pinning by setting this; trust them to point at a working binary.
+    explicit = os.environ.get("HERMES_BROWSER_BIN", "").strip()
+    if explicit:
+        _bt._cached_agent_browser = explicit
+        _bt._agent_browser_resolved = True
+        return explicit
 
     def _not_found(cached: bool) -> FileNotFoundError:
         return FileNotFoundError(f"agent-browser CLI not found{' (cached)' if cached else ''}. Install it with: "
