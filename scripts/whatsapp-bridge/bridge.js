@@ -122,9 +122,13 @@ const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || ''
 // Python adapter still applies group policy and mention rules after intake.
 const GROUP_ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_GROUP_ALLOWED_USERS || '');
 const DEFAULT_REPLY_PREFIX = '☤ *Hermes Agent*\n────────────\n';
-const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
-  ? DEFAULT_REPLY_PREFIX
-  : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
+// Empty / quoted-empty sentinels mean "no prefix".  The Unix kernel drops
+// empty env values, so an unset var and an empty value are the same thing —
+// treat both as an explicit disable instead of falling back to DEFAULT.
+const _rawReplyPrefix = process.env.WHATSAPP_REPLY_PREFIX;
+const REPLY_PREFIX = _rawReplyPrefix === undefined || _rawReplyPrefix === '' || _rawReplyPrefix === '""'
+  ? null
+  : _rawReplyPrefix.replace(/\\n/g, '\n');
 const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
 const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
 // Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever

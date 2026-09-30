@@ -278,7 +278,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._bridge_port: int = extra.get("bridge_port", 3000)
         self._bridge_script: str = extra.get("bridge_script", str(self._DEFAULT_BRIDGE_DIR / "bridge.js"))
         self._session_path = Path(extra.get("session_path", get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")))
-        self._reply_prefix: Optional[str] = extra.get("reply_prefix")
+        _raw_reply_prefix = extra.get("reply_prefix")
+        # YAML `reply_prefix: ''` / `'""'` reach us as the two-character
+        # sentinels the user set; both mean "send no prefix at all".
+        if _raw_reply_prefix in (None, "", "''", '""'):
+            self._reply_prefix: Optional[str] = None
+        else:
+            self._reply_prefix = str(_raw_reply_prefix)
         self._dm_policy = str(_extra_or_secret(extra, "dm_policy", "WHATSAPP_DM_POLICY", "pairing")).strip().lower()
         self._allow_from = self._coerce_allow_list(self._select_dm_allowlist(extra, ("WHATSAPP_ALLOWED_USERS",), _wenv))
         self._group_policy = str(_extra_or_secret(extra, "group_policy", "WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
