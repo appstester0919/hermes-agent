@@ -304,4 +304,30 @@ def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:
 
 
 def _is_retryable_connect_error(exc: Exception) -> bool:
-    return isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError))
+    """True when a transport failure means "this pool is unusable, throw it away and try the next path".
+
+    A failure that is NOT classified as retryable is re-raised as-is, which skips both
+    ``_reset_fallback`` / ``_reset_primary`` and the sticky-IP clear. The poisoned pool then stays
+    in place and every later attempt reuses the same broken path, so a single unclassified failure
+    wedges the adapter until the process restarts.
+
+    ``httpx.PoolTimeout`` is the important addition: the abandoned init task (the reconnect ladder
+    cancels and abandons it, so the shielded httpx request keeps its pool slot) eventually fills
+    the pool, and from then on every request waits for a free slot instead of failing fast. The
+    adapter layer already treats a pool timeout as safe to retry
+    (``TelegramAdapter._looks_like_pool_timeout``), so the transport layer must agree with it —
+    otherwise the pool is never rebuilt and the gateway cannot recover on its own.
+
+    ``httpx.ReadTimeout`` / ``httpx.ReadError`` / ``httpx.RemoteProtocolError`` cover the other
+    half-open-socket case: the peer accepted the TCP connection and then went silent, so the
+    request hangs until the attempt budget expires without ever raising a connect error.
+    """
+    return isinstance(exc, (
+        httpx.ConnectTimeout,
+        httpx.ConnectError,
+        httpx.PoolTimeout,
+        httpx.ReadTimeout,
+        httpx.WriteTimeout,
+        httpx.ReadError,
+        httpx.RemoteProtocolError,
+    ))
