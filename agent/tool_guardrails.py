@@ -626,6 +626,13 @@ def _result_hash(result: str | None, tool_name: str = "") -> str:
     parsed = safe_json_loads(result or "")
     if parsed is None:
         return _sha256(result or "")
+    # Issue #141633 fix: a harness repeat-refusal embeds a rising counter
+    # (already_searched/already_read), so hashing it as-is makes every refusal
+    # look like a NEW result and the no-progress streak restarts at 1. Give all
+    # refusals one canonical hash; the call signature already identifies what
+    # was refused.
+    if is_guardrail_refusal(parsed):
+        return _sha256(_canonical_json({"guardrail_refusal": True}))
     if tool_name == "execute_code":
         parsed = _without_execute_code_metadata(parsed)
     return _sha256(_canonical_json(parsed))

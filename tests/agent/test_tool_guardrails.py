@@ -478,3 +478,33 @@ def test_execute_code_replay_streak_notice_fires_on_warn_only_desktop_config():
     assert notices[:2] == [None, None]
     assert all(n is not None and "consecutive identical call to execute_code" in n for n in notices[2:]), notices
     assert controller.halt_decision is None, "warn-only surfaces must not halt"
+
+
+def test_rising_counter_guardrail_refusals_still_hard_stop():
+    """Issue #141633: refusal bodies embed a rising counter; they must hash as
+    one canonical non-result so the no-progress streak reaches the block."""
+    config = ToolCallGuardrailConfig(hard_stop_enabled=True, no_progress_block_after=5)
+    controller = ToolCallGuardrailController(config)
+    args = {"pattern": "x"}
+    halted = False
+    for count in range(4, 12):
+        decision = controller.before_call("search_files", args)
+        if decision.action == "block":
+            halted = True
+            break
+        result = json.dumps({"error": f"BLOCKED: You have run this exact search {count} times in a row.",
+                             "already_searched": count, "guardrail_refusal": True})
+        controller.after_call("search_files", args, result)
+        controller.observe_call("search_files", args, result)
+    assert halted
+
+
+def test_guardrail_refusals_of_different_calls_do_not_share_a_streak():
+    config = ToolCallGuardrailConfig(hard_stop_enabled=True, no_progress_block_after=5)
+    controller = ToolCallGuardrailController(config)
+    for count in range(8):
+        result = json.dumps({"error": f"BLOCKED: {count}", "already_searched": count,
+                             "guardrail_refusal": True})
+        controller.after_call("search_files", {"pattern": f"p{count}"}, result)
+        controller.observe_call("search_files", {"pattern": f"p{count}"}, result)
+    assert controller.halt_decision is None
